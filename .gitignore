@@ -1,17 +1,17 @@
-# Credenziali e Configurazione (FONDAMENTALE)
+# Credenziali e certificati
 config.py
+*.crt
+*.key
 auth.py
-*.env
 
-# File di dati e log
-*.json
+# Log e dati di sessione
 *.log
-logs/
-__pycache__/
-*.pyc
+*.csv
+value_bets.json
 
-# Cartelle di sistema/ambiente virtuale
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
 venv/
-.venv/
-.idea/
-.vscode/
+.env

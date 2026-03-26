@@ -17,7 +17,8 @@ import betfairlightweight
 from betfairlightweight.filters import streaming_market_filter
 from flumine import Flumine, clients
 
-from config import (
+from auth import get_session
+from config import (BETFAIR_CONFIG, 
     USERNAME, PASSWORD, APP_KEY,
     DRY_RUN, BANKROLL, VALUE_BETS_JSON
 )
@@ -70,6 +71,9 @@ def enrich_with_market_ids(
 
         logger.info(f"Cercando mercato per: {home} vs {away} ({league}) {date}")
 
+        if vb.get("market_id"):
+            enriched.append(vb)
+            continue
         market_info = find_dc_market(trading, home, away, league, date)
 
         if market_info is None:
@@ -99,17 +103,16 @@ def run_bot(dry_run: bool = DRY_RUN):
 
     # ─── LOGIN BETFAIR ───────────────────────────────────────────────────────
     trading = betfairlightweight.APIClient(
-        username=USERNAME,
-        password=PASSWORD,
-        app_key=APP_KEY,
-        locale="italian",
+        username=BETFAIR_CONFIG['username'],
+        password=BETFAIR_CONFIG['password'],
+        app_key=BETFAIR_CONFIG['app_key']
     )
-    try:
-        trading.login()
-        logger.info("Login Betfair OK")
-    except Exception as e:
-        logger.critical(f"Login fallito: {e}")
-        notify_error(f"Login Betfair fallito: {e}")
+    token = get_session()
+    if token:
+        trading.session_token = token
+        logger.info("Login Betfair.it OK (Session Injected)")
+    else:
+        logger.critical("Login fallito: Impossibile ottenere il token")
         sys.exit(1)
 
     # ─── CARICA VALUE BETS ───────────────────────────────────────────────────
@@ -134,7 +137,7 @@ def run_bot(dry_run: bool = DRY_RUN):
 
     # ─── SETUP FLUMINE ───────────────────────────────────────────────────────
     if dry_run:
-        client = clients.SimulatedBetfairClient(trading)
+        client = clients.SimulatedClient(trading)
     else:
         client = clients.BetfairClient(trading)
 
@@ -144,9 +147,6 @@ def run_bot(dry_run: bool = DRY_RUN):
         value_bets=value_bets,
         bankroll=BANKROLL,
         market_filter=streaming_market_filter(market_ids=market_ids),
-        max_order_validation_time=5.0,
-        max_trade_count=1,         # max 1 scommessa per mercato
-        max_live_trade_count=1,
     )
 
     framework.add_strategy(strategy)

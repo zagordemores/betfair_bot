@@ -60,6 +60,7 @@ TEAM_NAME_MAP = {
 # ─── MAPPA CAMPIONATI: DC Value Engine → Betfair competition_id ────────────
 LEAGUE_MAP = {
     "serie_a":           {"event_type": "1", "competition_id": "81",    "country": "IT"},
+    "test": {"event_type": "1", "competition_id": None, "country": None},
     "premier_league":    {"event_type": "1", "competition_id": "10932", "country": "GB"},
     "la_liga":           {"event_type": "1", "competition_id": "117",   "country": "ES"},
     "champions_league":  {"event_type": "1", "competition_id": "228",   "country": None},
@@ -93,7 +94,7 @@ def find_market(
     market_type: str = "MATCH_ODDS",
     hours_window: int = 36,   # cerca partite entro N ore dalla data
     min_similarity: float = 0.6,
-) -> dict | None:
+) -> object:
     """
     Trova il market_id Betfair per una partita specifica.
 
@@ -120,7 +121,7 @@ def find_market(
     filtro = market_filter(
         event_type_ids=[league_info["event_type"]],
         competition_ids=[league_info["competition_id"]],
-        market_types=[market_type],
+        market_type_codes=[market_type],
         market_start_time={
             "from": from_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "to":   to_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -212,7 +213,7 @@ def find_dc_market(
     away: str,
     league: str,
     match_date: str,
-) -> dict | None:
+) -> object:
     """
     Trova il mercato DOUBLE_CHANCE (se disponibile) o deriva
     le quote DC dal mercato MATCH_ODDS principale.
@@ -247,50 +248,27 @@ def find_dc_market(
 
 # ─── TEST STANDALONE ────────────────────────────────────────────────────────
 
+
 if __name__ == "__main__":
     import os
-    import sys
-    sys.path.append(os.getcwd())
     from auth import get_session
     from config import BETFAIR_CONFIG
-
+    
     logging.basicConfig(level=logging.INFO)
-
-    # Inizializziamo il client senza login automatico
+    
     trading = betfairlightweight.APIClient(
         username=BETFAIR_CONFIG['username'],
         password=BETFAIR_CONFIG['password'],
         app_key=BETFAIR_CONFIG['app_key']
     )
-
-    # Otteniamo il token con il nostro metodo funzionante
+    
     token = get_session()
     if token:
         trading.session_token = token
-        print(f"✅ Sessione iniettata correttamente.")
-        
-        # Test con l'Italia di stasera (le Nazionali non hanno competition_id 81)
-        # Modifichiamo temporaneamente la LEAGUE_MAP per il test
-        LEAGUE_MAP["test"] = {"event_type": "1", "competition_id": None, "country": None}
-        
-        print("Ricerca match Italia...")
-        result = find_market(
-            trading,
-            home="Italy",
-            away="Northern Ireland",
-            league="test",
-            match_date=datetime.now().strftime("%Y-%m-%d"),
-            hours_window=48
-        )
-
-        if result:
-            print(f"
-🎯 Mercato Trovato!")
-            print(f"  ID: {result['market_id']}")
-            print(f"  Evento: {result['market_name']}")
-            print(f"  Runners: {result['runners']}")
-        else:
-            print("
-❌ Match non trovato. Verifica se il nome 'Italy' è corretto nel palinsesto.")
+        print("✅ Test Mapping: Sessione attiva")
+        # Test rapido con nomi generici
+        res = find_dc_market(trading, "Italy", "Northern Ireland", "serie_a", datetime.now().strftime("%Y-%m-%d"))
+        if res:
+            print(f"🎯 Trovato: {res['market_name']}")
     else:
-        print("❌ Impossibile ottenere il session token.")
+        print("❌ Login fallito")

@@ -177,7 +177,7 @@ class DCBettingStrategy(BaseStrategy):
         dc_type: str,
         runners_map: dict,
         use_match_odds: bool,
-    ) -> float | None:
+    ) -> float:
         """
         Calcola la quota Doppia Chance dal market book.
 

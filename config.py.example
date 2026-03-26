@@ -1,0 +1,12 @@
+# Rinomina questo file in config.py e inserisci i tuoi dati
+BETFAIR_CONFIG = {
+    "app_key": "TUA_APP_KEY_QUI",
+    "username": "TUO_EMAIL_QUI",
+    "password": "TUA_PASSWORD_QUI",
+    "is_it": True
+}
+
+DRY_RUN = True  # Imposta a False solo quando hai saldo e vuoi scommettere davvero
+MIN_EDGE = 0.08  # 8%
+MIN_ODDS = 1.20
+MAX_ODDS = 5.0

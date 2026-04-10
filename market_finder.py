@@ -1,9 +1,13 @@
 """
-market_finder.py
-Trova il market_id Betfair corrispondente a una partita del DC Value Engine.
+market_finder.py v2
+Trova il market_id Betfair per una partita del DC Value Engine.
 
-Il problema principale: il DC Value Engine usa nomi come "Inter" o "AC Pisa",
-mentre Betfair usa nomi come "Internazionale" o "Pisa". Serve un fuzzy match robusto.
+FIX v2:
+  - Premier League competition_id corretto: 10932509 (era 10932)
+  - Runner mapping corretto per mercati DOUBLE_CHANCE
+    I runner DC si chiamano "Home or Draw", "Away or Draw", "Home or Away"
+    NON i nomi delle squadre — il vecchio fuzzy match falliva sempre
+  - Aggiunto logging debug per i runner trovati
 """
 
 import betfairlightweight
@@ -14,75 +18,100 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ─── MAPPA NOMI: DC Value Engine → Betfair ─────────────────────────────────
-# Aggiungere qui le squadre che non vengono trovate automaticamente
+# ─── MAPPA NOMI: DC Value Engine → Betfair ──────────────────────────────────
 TEAM_NAME_MAP = {
     # Serie A
-    "inter":            "internazionale",
-    "milan":            "ac milan",
-    "roma":             "as roma",
-    "lazio":            "ss lazio",
-    "napoli":           "ssc napoli",
-    "juventus":         "juventus",
-    "atalanta":         "atalanta",
-    "fiorentina":       "acf fiorentina",
-    "bologna":          "bologna",
-    "torino":           "torino",
-    "udinese":          "udinese",
-    "genoa":            "genoa",
-    "cagliari":         "cagliari",
-    "lecce":            "lecce",
-    "verona":           "hellas verona",
-    "ac pisa":          "pisa",
-    "sassuolo":         "sassuolo",
-    "parma":            "parma",
-    "como 1907":        "como",
-    "cremonese":        "cremonese",
+    "inter":        "internazionale",
+    "milan":        "ac milan",
+    "roma":         "as roma",
+    "lazio":        "ss lazio",
+    "napoli":       "ssc napoli",
+    "fiorentina":   "acf fiorentina",
+    "verona":       "hellas verona",
+    "ac pisa":      "pisa",
+    "como 1907":    "como",
+    # Premier League
+    "man city":     "manchester city",
+    "man united":   "manchester united",
+    "brighton hove": "brighton",
+    "nottingham":   "nottingham forest",
+    "leeds united": "leeds",
+    # La Liga
+    "atletico":     "atletico madrid",
+    "barça":        "barcelona",
     # Champions League
-    "real madrid":      "real madrid",
-    "barcelona":        "barcelona",
-    "barça":            "barcelona",
-    "man city":         "manchester city",
-    "man united":       "manchester united",
-    "atletico":         "atletico madrid",
-    "psv":              "psv eindhoven",
-    "leverkusen":       "bayer leverkusen",
-    "dortmund":         "borussia dortmund",
-    "rb leipzig":       "rb leipzig",
-    "porto":            "porto",
-    "benfica":          "benfica",
-    "celtic":           "celtic",
-    "rangers":          "rangers",
-    "ajax":             "ajax",
-    "psv":              "psv eindhoven",
+    "psv":          "psv eindhoven",
+    "leverkusen":   "bayer leverkusen",
+    "dortmund":     "borussia dortmund",
+    "rb leipzig":   "rb leipzig",
+    "sporting cp":  "sporting",
 }
 
-# ─── MAPPA CAMPIONATI: DC Value Engine → Betfair competition_id ────────────
+# ─── MAPPA CAMPIONATI ────────────────────────────────────────────────────────
 LEAGUE_MAP = {
-    "serie_a":           {"event_type": "1", "competition_id": "81",    "country": "IT"},
-    "test": {"event_type": "1", "competition_id": None, "country": None},
-    "premier_league":    {"event_type": "1", "competition_id": "10932", "country": "GB"},
-    "la_liga":           {"event_type": "1", "competition_id": "117",   "country": "ES"},
-    "champions_league":  {"event_type": "1", "competition_id": "228",   "country": None},
-    "europa_league":     {"event_type": "1", "competition_id": "2005",  "country": None},
-    "conference_league": {"event_type": "1", "competition_id": "6422",  "country": None},
+    "serie_a":           {"event_type": "1", "competition_id": "81",       "country": "IT"},
+    "premier_league":    {"event_type": "1", "competition_id": "10932509", "country": "GB"},  # FIX: era 10932
+    "la_liga":           {"event_type": "1", "competition_id": "117",      "country": "ES"},
+    "champions_league":  {"event_type": "1", "competition_id": "228",      "country": None},
+    "europa_league":     {"event_type": "1", "competition_id": "2005",     "country": None},
+    "conference_league": {"event_type": "1", "competition_id": "12375833", "country": None},  # FIX: era 6422
 }
 
 
 def normalize(name: str) -> str:
-    """Normalizza nome squadra per il confronto."""
     name = name.lower().strip()
-    # Rimuovi prefissi comuni
     for prefix in ["fc ", "ac ", "as ", "ss ", "ssc ", "afc ", "cf "]:
         if name.startswith(prefix):
             name = name[len(prefix):]
-    # Applica mappa aliases
     return TEAM_NAME_MAP.get(name, name)
 
 
 def similarity(a: str, b: str) -> float:
-    """Calcola similarità tra due stringhe (0-1)."""
     return SequenceMatcher(None, normalize(a), normalize(b)).ratio()
+
+
+def _extract_runners(best_match, home: str, away: str, market_type: str) -> dict:
+    """
+    Estrae i selection_id dei runner in base al tipo di mercato.
+
+    MATCH_ODDS: runner si chiamano come le squadre + "The Draw"
+    DOUBLE_CHANCE: runner si chiamano "Home or Draw", "Away or Draw", "Home or Away"
+    """
+    runners = {}
+    home_norm = normalize(home)
+    away_norm = normalize(away)
+
+    logger.debug(f"Estrazione runner per mercato {market_type}:")
+
+    for runner in best_match.runners:
+        name = runner.runner_name.lower().strip()
+        sid  = runner.selection_id
+        logger.debug(f"  Runner: '{runner.runner_name}' (id={sid})")
+
+        if market_type == "DOUBLE_CHANCE":
+            # Runner DC: "Home or Draw", "Away or Draw", "Home or Away"
+            # Betfair.it può usare "Home/Draw" o "1X" o varianti — gestiamo tutti
+            if any(x in name for x in ["home or draw", "1x", "home/draw", "casa o pareggio", "1 x"]):
+                runners["home_draw"] = sid
+            elif any(x in name for x in ["draw or away", "x2", "away/draw", "trasferta o pareggio", "x 2"]):
+                runners["away_draw"] = sid
+            elif any(x in name for x in ["home or away", "12", "home/away", "casa o trasferta", "1 2"]):
+                runners["home_away"] = sid
+            else:
+                logger.debug(f"  Runner DC non classificato: '{runner.runner_name}'")
+
+        else:  # MATCH_ODDS
+            if "draw" in name or "pareggio" in name or name == "x":
+                runners["draw"] = sid
+            elif similarity(home_norm, name) > 0.65:
+                runners["home"] = sid
+            elif similarity(away_norm, name) > 0.65:
+                runners["away"] = sid
+            else:
+                logger.debug(f"  Runner MATCH_ODDS non classificato: '{runner.runner_name}'")
+
+    logger.debug(f"  Runners estratti: {runners}")
+    return runners
 
 
 def find_market(
@@ -90,24 +119,20 @@ def find_market(
     home: str,
     away: str,
     league: str,
-    match_date: str,          # formato YYYY-MM-DD
+    match_date: str,
     market_type: str = "MATCH_ODDS",
-    hours_window: int = 36,   # cerca partite entro N ore dalla data
+    hours_window: int = 36,
     min_similarity: float = 0.6,
-) -> object:
+) -> dict:
     """
     Trova il market_id Betfair per una partita specifica.
-
-    Returns:
-        dict con market_id, market_name, runners, start_time
-        oppure None se non trovato
+    Restituisce dict con market_id, market_name, runners, use_match_odds.
     """
     league_info = LEAGUE_MAP.get(league)
     if not league_info:
         logger.error(f"Campionato non mappato: {league}")
         return None
 
-    # Finestra temporale intorno alla data della partita
     try:
         match_dt = datetime.strptime(match_date, "%Y-%m-%d")
     except ValueError:
@@ -117,7 +142,6 @@ def find_market(
     from_dt = match_dt - timedelta(hours=2)
     to_dt   = match_dt + timedelta(hours=hours_window)
 
-    # Costruisci filtro
     filtro = market_filter(
         event_type_ids=[league_info["event_type"]],
         competition_ids=[league_info["competition_id"]],
@@ -144,7 +168,6 @@ def find_market(
         logger.warning(f"Nessun mercato trovato per {home} vs {away} ({league})")
         return None
 
-    # Fuzzy match sul nome dell'evento
     home_norm = normalize(home)
     away_norm = normalize(away)
 
@@ -153,7 +176,6 @@ def find_market(
 
     for market in catalogo:
         event_name = market.event.name if market.event else ""
-        # Betfair scrive "Home v Away" o "Home vs Away"
         parts = event_name.replace(" v ", " vs ").split(" vs ")
         if len(parts) != 2:
             continue
@@ -165,10 +187,7 @@ def find_market(
         score_a = similarity(away_norm, mkt_away)
         score   = (score_h + score_a) / 2
 
-        logger.debug(
-            f"  Confronto: '{home}' vs '{away}' ↔ '{parts[0]}' vs '{parts[1]}' "
-            f"→ score {score:.2f}"
-        )
+        logger.debug(f"  '{home}' vs '{away}' ↔ '{parts[0]}' vs '{parts[1]}' → {score:.2f}")
 
         if score > best_score:
             best_score = score
@@ -181,16 +200,8 @@ def find_market(
         )
         return None
 
-    # Estrai runner IDs (casa=prima selezione, away=seconda, draw=terza)
-    runners = {}
-    for runner in best_match.runners:
-        name = runner.runner_name.lower()
-        if normalize(home) in name or similarity(home_norm, name) > 0.7:
-            runners["home"] = runner.selection_id
-        elif normalize(away) in name or similarity(away_norm, name) > 0.7:
-            runners["away"] = runner.selection_id
-        else:
-            runners["draw"] = runner.selection_id
+    # Estrai runner con logica corretta per tipo mercato
+    runners = _extract_runners(best_match, home, away, market_type)
 
     result = {
         "market_id":   best_match.market_id,
@@ -202,7 +213,7 @@ def find_market(
 
     logger.info(
         f"Mercato trovato: {best_match.market_name} "
-        f"[{best_match.market_id}] score={best_score:.2f}"
+        f"[{best_match.market_id}] score={best_score:.2f} runners={runners}"
     )
     return result
 
@@ -213,15 +224,12 @@ def find_dc_market(
     away: str,
     league: str,
     match_date: str,
-) -> object:
+) -> dict:
     """
-    Trova il mercato DOUBLE_CHANCE (se disponibile) o deriva
-    le quote DC dal mercato MATCH_ODDS principale.
-
-    Returns:
-        dict con market_id del DC o del MATCH_ODDS + flag use_match_odds
+    Cerca prima il mercato DOUBLE_CHANCE, poi fallback su MATCH_ODDS.
+    Restituisce dict con use_match_odds=False (DC diretto) o True (MATCH_ODDS).
     """
-    # Prova prima il mercato DC diretto
+    # Prova DC diretto
     dc_market = find_market(
         trading, home, away, league, match_date,
         market_type="DOUBLE_CHANCE"
@@ -230,45 +238,36 @@ def find_dc_market(
         dc_market["use_match_odds"] = False
         return dc_market
 
-    # Fallback: usa MATCH_ODDS e calcola DC in codice
+    # Fallback MATCH_ODDS
     mo_market = find_market(
         trading, home, away, league, match_date,
         market_type="MATCH_ODDS"
     )
     if mo_market:
         mo_market["use_match_odds"] = True
-        logger.info(
-            f"Mercato DC non disponibile per {home} vs {away}, "
-            f"uso MATCH_ODDS con calcolo DC interno"
-        )
+        logger.info(f"DC non disponibile per {home} vs {away} — uso MATCH_ODDS")
         return mo_market
 
     return None
 
 
-# ─── TEST STANDALONE ────────────────────────────────────────────────────────
-
-
 if __name__ == "__main__":
-    import os
     from auth import get_session
     from config import BETFAIR_CONFIG
-    
-    logging.basicConfig(level=logging.INFO)
-    
+    logging.basicConfig(level=logging.DEBUG)
+
     trading = betfairlightweight.APIClient(
         username=BETFAIR_CONFIG['username'],
         password=BETFAIR_CONFIG['password'],
         app_key=BETFAIR_CONFIG['app_key']
     )
-    
-    token = get_session()
-    if token:
-        trading.session_token = token
-        print("✅ Test Mapping: Sessione attiva")
-        # Test rapido con nomi generici
-        res = find_dc_market(trading, "Italy", "Northern Ireland", "serie_a", datetime.now().strftime("%Y-%m-%d"))
-        if res:
-            print(f"🎯 Trovato: {res['market_name']}")
+    trading.session_token = get_session()
+
+    # Test con partita reale questa settimana
+    res = find_dc_market(trading, "Torino", "Verona", "serie_a", "2026-04-11")
+    if res:
+        print(f"Trovato: {res['market_name']} [{res['market_id']}]")
+        print(f"Runners: {res['runners']}")
+        print(f"use_match_odds: {res['use_match_odds']}")
     else:
-        print("❌ Login fallito")
+        print("Non trovato")

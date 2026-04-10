@@ -1,105 +1,158 @@
 """
 strategy.py — DCBettingStrategy
-Cuore del bot: legge i value bet, monitora le quote Betfair in streaming,
-e piazza le scommesse quando le condizioni sono soddisfatte.
+
+PATCH v4:
+  - Edge calcolato su quote live Betfair Exchange
+  - Runner DC corretti per mercati DOUBLE_CHANCE
+  - placed persistito su disco (placed.json) — sopravvive ai crash
+  - Check saldo disponibile prima di piazzare (solo live)
 """
 
+import json
 import logging
+import os
 from datetime import datetime, timezone
 
 from flumine import BaseStrategy
 from flumine.markets.market import Market
 from betfairlightweight.resources import MarketBook
 from flumine.order.trade import Trade
-from flumine.order.order import LimitOrder, OrderStatus
+from flumine.order.order import LimitOrder
 
-from kelly_sizer import kelly_stake, dc_to_runner_bets
+from kelly_sizer import kelly_stake, dc_to_runner_bets, BETFAIR_COMMISSION
 from logger import log_bet, notify_bet_placed
 from config import DRY_RUN, MIN_EDGE, MIN_ODDS, MAX_ODDS
 
 logger = logging.getLogger(__name__)
 
+PLACED_FILE = os.path.join(os.path.dirname(__file__), 'placed.json')
+
+
+def _load_placed() -> set:
+    """Carica il set dei market_id già scommessi dal disco."""
+    try:
+        if os.path.exists(PLACED_FILE):
+            data = json.load(open(PLACED_FILE))
+            placed = set(data.get('market_ids', []))
+            logger.info(f"Placed caricato da disco: {len(placed)} mercati già scommessi")
+            return placed
+    except Exception as e:
+        logger.error(f"Errore caricamento placed.json: {e}")
+    return set()
+
+
+def _save_placed(placed: set):
+    """Salva il set dei market_id già scommessi su disco."""
+    try:
+        with open(PLACED_FILE, 'w') as f:
+            json.dump({'market_ids': list(placed), 'updated': datetime.now().isoformat()}, f)
+    except Exception as e:
+        logger.error(f"Errore salvataggio placed.json: {e}")
+
 
 class DCBettingStrategy(BaseStrategy):
-    """
-    Strategia di betting su Doppia Chance derivata dal Dixon-Coles model.
-
-    Per ogni mercato monitorato:
-    1. Legge la value bet corrispondente (caricata da value_bets.json)
-    2. Controlla le quote live in streaming
-    3. Se la quota >= min_odds richiesta, piazza la scommessa con Kelly stake
-    4. Non piazza mai due volte sulla stessa partita
-    """
 
     def __init__(self, value_bets: list, bankroll: float, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Dizionario market_id → value_bet
-        self.value_bets   = {vb["market_id"]: vb for vb in value_bets if vb.get("market_id")}
-        self.bankroll     = bankroll
-        self.placed       = set()   # market_id già scommessi
+        self.value_bets = {vb["market_id"]: vb for vb in value_bets if vb.get("market_id")}
+        self.bankroll = bankroll
+        self.placed = _load_placed()  # carica da disco
+        self.total_liability = 0.0
+
         logger.info(f"DCBettingStrategy init: {len(self.value_bets)} mercati monitorati")
 
     def check_market_book(self, market: Market, market_book: MarketBook) -> bool:
-        """Chiamato da Flumine ad ogni aggiornamento. Ritorna True se processare."""
-        # Processa solo mercati che abbiamo in lista
         if market_book.market_id not in self.value_bets:
             return False
-        # Non processare mercati già scommessi
         if market_book.market_id in self.placed:
             return False
-        # Non processare mercati già chiusi o in-play (se non vogliamo)
         if market_book.status != "OPEN":
             return False
-        # Non processare se la partita è già iniziata
         if market_book.inplay:
             return False
         return True
 
     def process_market_book(self, market: Market, market_book: MarketBook):
-        """Logica principale: controlla quote e piazza scommessa se valida."""
         market_id = market_book.market_id
         vb = self.value_bets[market_id]
 
-        dc_type     = vb["dc_type"]         # "1X", "X2", "12"
-        prob_model  = vb["prob_model"]      # probabilità stimata dal Dixon-Coles
-        min_odds_req = vb["min_odds"]       # quota minima accettata (da DC Value Engine)
-        runners_map  = vb["runners"]        # {"home": id, "draw": id, "away": id}
+        dc_type    = vb["dc_type"]
+        prob_model = vb["prob_model"]  # prob DC dal Dixon-Coles
+        runners_map = vb.get("runners", {})
         use_match_odds = vb.get("use_match_odds", True)
 
-        # Calcola la quota DC dalle quote live
-        current_odds = self._get_dc_odds(market_book, dc_type, runners_map, use_match_odds)
-        if current_odds is None:
-            logger.debug(f"[{market_id}] Quote DC non disponibili")
+        # ── STEP 1: Leggi quote live Betfair ─────────────────────────────
+        # Ottieni la quota del runner che layiamo (l'esito scoperto dalla DC)
+        odds_lay_live = self._get_lay_odds(market_book, dc_type, runners_map, use_match_odds)
+
+        if odds_lay_live is None:
+            logger.debug(f"[{market_id}] Quote live non disponibili")
             return
 
-        # Verifica che la quota sia ancora accettabile
-        if current_odds < min_odds_req:
+        # Filtro base sulle odds (guardrail di sicurezza)
+        if odds_lay_live < MIN_ODDS or odds_lay_live > MAX_ODDS:
             logger.debug(
-                f"[{market_id}] Quota {current_odds:.2f} < minima {min_odds_req:.2f}, skip"
+                f"[{market_id}] Quota lay {odds_lay_live:.2f} fuori range "
+                f"[{MIN_ODDS}-{MAX_ODDS}], skip"
             )
             return
 
-        # Calcola Kelly stake
+        # ── STEP 2: Calcola edge REALE su quote Betfair live ─────────────
+        # Edge LAY = prob_dc * (1-commission) - prob_esito_scoperto * (odds_lay - 1)
+        # dove prob_esito_scoperto = 1 - prob_dc
+        #
+        # Questo è l'edge effettivo che realizziamo se il LAY viene matchato
+        # a odds_lay_live — non una stima basata su bookmaker terzi.
+        p_win  = prob_model              # prob che la DC si verifichi (lay vince)
+        p_loss = 1.0 - prob_model        # prob che il lay perda
+        b_net  = 1.0 * (1.0 - BETFAIR_COMMISSION)
+        liab   = odds_lay_live - 1.0
+
+        if liab <= 0:
+            return
+
+        edge_abs = p_win * b_net - p_loss * liab
+        edge_pct = (edge_abs / liab) * 100  # edge relativo alla liability
+
+        # Quota implicita Betfair per il runner layato
+        implied_prob_betfair = 1.0 / odds_lay_live
+
+        logger.debug(
+            f"[{market_id}] {vb['home']} vs {vb['away']} | DC {dc_type} | "
+            f"odds_lay={odds_lay_live:.2f} | implied={implied_prob_betfair:.1%} | "
+            f"prob_dc={prob_model:.1%} | edge={edge_pct:.1f}%"
+        )
+
+        if edge_pct < MIN_EDGE * 100:
+            logger.debug(
+                f"[{market_id}] Edge Betfair {edge_pct:.1f}% < minimo "
+                f"{MIN_EDGE*100:.0f}%, skip"
+            )
+            return
+
+        # ── STEP 3: Kelly stake su quote Betfair live ─────────────────────
         sizing = kelly_stake(
             prob=prob_model,
-            odds=current_odds,
+            odds=odds_lay_live,
             bankroll=self.bankroll,
+            bet_type="LAY",
         )
 
         if not sizing["valid"]:
             logger.info(f"[{market_id}] Kelly non valido: {sizing['reason']}")
             return
 
-        if sizing["edge"] < MIN_EDGE * 100:
-            logger.info(
-                f"[{market_id}] Edge {sizing['edge']:.1f}% < minimo {MIN_EDGE*100:.0f}%, skip"
-            )
-            return
-
         stake = sizing["stake"]
+        max_liability = sizing["max_liability"]
 
-        # ─── PIAZZA SCOMMESSA ─────────────────────────────────────────────
-        # Su Betfair Exchange, per la DC facciamo LAY sull'esito scoperto
+        # ── STEP 4: Trova runner LAY ──────────────────────────────────────
+        # Normalizza runners_map se use_match_odds=False (chiavi DC → standard)
+        if not use_match_odds:
+            runners_map = {
+                "home": runners_map.get("home_draw"),
+                "draw": runners_map.get("home_away"),
+                "away": runners_map.get("away_draw"),
+            }
         dc_runners = dc_to_runner_bets(dc_type, runners_map)
         lay_id = dc_runners.get("lay")
 
@@ -107,43 +160,79 @@ class DCBettingStrategy(BaseStrategy):
             logger.error(f"[{market_id}] Runner LAY non trovato per DC {dc_type}")
             return
 
+        # ── STEP 5: P&L simulato ──────────────────────────────────────────
+        profit_if_win = round(stake * (1.0 - BETFAIR_COMMISSION), 2)
+        loss_if_lose  = round(stake * (odds_lay_live - 1.0), 2)
+
         bet_info = {
-            "home":      vb["home"],
-            "away":      vb["away"],
-            "league":    vb["league"],
-            "date":      vb["date"],
-            "dc_type":   dc_type,
-            "odds":      current_odds,
-            "prob_model": prob_model,
-            "edge_pct":  sizing["edge"],
-            "kelly_pct": sizing["kelly_pct"],
-            "stake":     stake,
-            "market_id": market_id,
-            "dry_run":   DRY_RUN,
+            "home":              vb["home"],
+            "away":              vb["away"],
+            "league":            vb["league"],
+            "date":              vb["date"],
+            "dc_type":           dc_type,
+            "odds":              odds_lay_live,           # quota LIVE Betfair
+            "implied_betfair":   round(implied_prob_betfair * 100, 1),
+            "prob_model":        prob_model,
+            "prob_lay":          round(1.0 - prob_model, 3),
+            "edge_pct":          round(edge_pct, 2),      # edge su Betfair live
+            "kelly_pct":         sizing["kelly_pct"],
+            "stake":             stake,
+            "max_liability":     max_liability,
+            "profit_if_win":     profit_if_win,
+            "loss_if_lose":      loss_if_lose,
+            "commission_pct":    sizing["commission_pct"],
+            "market_id":         market_id,
+            "dry_run":           DRY_RUN,
+            "timestamp":         datetime.now(timezone.utc).isoformat(),
         }
 
         if DRY_RUN:
             logger.info(
-                f"[DRY RUN] Piazzerei LAY {dc_type} su {vb['home']} vs {vb['away']} "
-                f"@{current_odds:.2f} stake €{stake:.2f} edge {sizing['edge']:.1f}%"
+                f"[DRY RUN] LAY {dc_type} | {vb['home']} vs {vb['away']} | "
+                f"quota Betfair {odds_lay_live:.2f} (implied {implied_prob_betfair:.1%}) | "
+                f"prob_DC {prob_model:.1%} | "
+                f"edge {edge_pct:.1f}% | stake €{stake:.2f} | "
+                f"liability €{max_liability:.2f} | "
+                f"win +€{profit_if_win:.2f} | loss -€{loss_if_lose:.2f}"
             )
             bet_info["status"] = "dry_run"
             bet_info["bet_id"] = "DRY"
+
         else:
-            # Trova il runner da lay
+            # ── LIVE: verifica saldo prima di piazzare ────────────────
+            try:
+                account = market._market.context.get('account_details')
+                if account:
+                    available = account.available_to_bet_balance
+                    if available < max_liability:
+                        logger.warning(
+                            f"[{market_id}] Saldo insufficiente: "
+                            f"disponibile €{available:.2f} < liability €{max_liability:.2f} — skip"
+                        )
+                        return
+            except Exception:
+                pass  # se non riesce a leggere il saldo, procede comunque
+
+            # ── Trova runner e piazza ordine ──────────────────────────────
             runner = next(
                 (r for r in market_book.runners if r.selection_id == lay_id), None
             )
             if runner is None:
-                logger.error(f"[{market_id}] Runner {lay_id} non trovato nel market book")
+                logger.error(f"[{market_id}] Runner {lay_id} non trovato")
                 return
 
-            # Lay price = best back price del runner scoperto
             if not runner.ex.available_to_back:
                 logger.debug(f"[{market_id}] Nessuna liquidità back sul runner {lay_id}")
                 return
 
             lay_price = runner.ex.available_to_back[0].price
+            best_back_size = runner.ex.available_to_back[0].size
+
+            if best_back_size < stake * 0.5:
+                logger.warning(
+                    f"[{market_id}] Liquidità bassa: "
+                    f"disponibile €{best_back_size:.2f} vs stake €{stake:.2f}"
+                )
 
             trade = Trade(
                 market_id=market_id,
@@ -156,22 +245,29 @@ class DCBettingStrategy(BaseStrategy):
                 size=round(stake, 2),
                 price=lay_price,
             )
-            trade.place_order(order)
+
+            # FIX BUG #3: solo market.place_order(), mai trade.place_order()
+            trade.orders.append(order)
             market.place_order(order)
 
             bet_info["status"] = "placed"
             bet_info["bet_id"] = str(order.id) if order.id else "pending"
+            bet_info["odds"]   = lay_price  # prezzo effettivo di esecuzione
+
+            self.total_liability += max_liability
             logger.info(
-                f"[LIVE] LAY piazzato: {vb['home']} vs {vb['away']} "
-                f"DC {dc_type} @{lay_price:.2f} €{stake:.2f}"
+                f"[LIVE] LAY piazzato | {vb['home']} vs {vb['away']} | "
+                f"DC {dc_type} @{lay_price:.2f} | stake €{stake:.2f} | "
+                f"liability €{max_liability:.2f} | "
+                f"liability totale €{self.total_liability:.2f}"
             )
 
-        # Segna come piazzato e logga
         self.placed.add(market_id)
+        _save_placed(self.placed)  # persisti su disco
         log_bet(bet_info)
         notify_bet_placed(bet_info, DRY_RUN)
 
-    def _get_dc_odds(
+    def _get_lay_odds(
         self,
         market_book: MarketBook,
         dc_type: str,
@@ -179,61 +275,52 @@ class DCBettingStrategy(BaseStrategy):
         use_match_odds: bool,
     ) -> float:
         """
-        Calcola la quota Doppia Chance dal market book.
+        Restituisce la quota del runner che layiamo (l'esito scoperto dalla DC).
 
-        Se use_match_odds=True, deriva la DC dalle quote 1X2:
-        - DC 1X = 1 / (p_home + p_draw)
-        - DC X2 = 1 / (p_draw + p_away)
-        - DC 12 = 1 / (p_home + p_away)
+        MATCH_ODDS (use_match_odds=True):
+          runners_map = {"home": sid, "draw": sid, "away": sid}
+          DC 1X → lay away, DC X2 → lay home, DC 12 → lay draw
 
-        Dove p_X = 1 / best_back_odds_X
+        DOUBLE_CHANCE (use_match_odds=False):
+          runners_map = {"home_draw": sid, "away_draw": sid, "home_away": sid}
+          DC 1X → runner home_draw, DC X2 → runner away_draw, DC 12 → runner home_away
+          La quota di questo runner è la quota lay diretta.
         """
         try:
-            # Raccogli best back per ogni runner
             runner_odds = {}
             for runner in market_book.runners:
                 sid = runner.selection_id
                 if runner.ex.available_to_back:
-                    runner_odds[sid] = runner.ex.available_to_back[0].price
+                    item = runner.ex.available_to_back[0]
+                    runner_odds[sid] = item['price'] if isinstance(item, dict) else item.price
 
-            home_id = runners_map.get("home")
-            draw_id = runners_map.get("draw")
-            away_id = runners_map.get("away")
+            if use_match_odds:
+                # MATCH_ODDS: layiamo l'esito scoperto dalla DC
+                lay_runner_map = {
+                    "1X": runners_map.get("away"),
+                    "X2": runners_map.get("home"),
+                    "12": runners_map.get("draw"),
+                }
+                lay_id = lay_runner_map.get(dc_type)
+                if lay_id is None:
+                    logger.debug(f"Runner lay non trovato per DC {dc_type}: {runners_map}")
+                    return None
+                return runner_odds.get(lay_id)
 
-            if not use_match_odds:
-                # Mercato DC diretto — cerca la quota del runner DC
-                dc_runner_map = {"1X": home_id, "X2": away_id, "12": draw_id}
-                runner_id = dc_runner_map.get(dc_type)
-                return runner_odds.get(runner_id)
-
-            # Calcola DC da MATCH_ODDS
-            o_h = runner_odds.get(home_id)
-            o_d = runner_odds.get(draw_id)
-            o_a = runner_odds.get(away_id)
-
-            if None in (o_h, o_d, o_a):
-                return None
-
-            p_h = 1.0 / o_h
-            p_d = 1.0 / o_d
-            p_a = 1.0 / o_a
-
-            if dc_type == "1X":
-                dc_prob = p_h + p_d
-            elif dc_type == "X2":
-                dc_prob = p_d + p_a
-            elif dc_type == "12":
-                dc_prob = p_h + p_a
             else:
-                return None
-
-            if dc_prob <= 0:
-                return None
-
-            # Quota DC senza margin
-            dc_odds = round(1.0 / dc_prob, 2)
-            return dc_odds
+                # DOUBLE_CHANCE diretto: layiamo il runner DC corrispondente
+                dc_runner_map = {
+                    "1X": runners_map.get("home_draw"),
+                    "X2": runners_map.get("away_draw"),
+                    "12": runners_map.get("home_away"),
+                }
+                lay_id = dc_runner_map.get(dc_type)
+                if lay_id is None:
+                    logger.debug(f"Runner DC non trovato per DC {dc_type}: {runners_map}")
+                    return None
+                return runner_odds.get(lay_id)
 
         except Exception as e:
-            logger.error(f"Errore calcolo DC odds: {e}")
+            logger.error(f"Errore lettura quote live Betfair: {e}")
             return None
+

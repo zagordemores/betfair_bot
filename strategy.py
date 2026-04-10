@@ -103,16 +103,16 @@ class DCBettingStrategy(BaseStrategy):
         #
         # Questo è l'edge effettivo che realizziamo se il LAY viene matchato
         # a odds_lay_live — non una stima basata su bookmaker terzi.
-        p_win  = prob_model              # prob che la DC si verifichi (lay vince)
-        p_loss = 1.0 - prob_model        # prob che il lay perda
-        b_net  = 1.0 * (1.0 - BETFAIR_COMMISSION)
-        liab   = odds_lay_live - 1.0
+        implied_prob_betfair = 1.0 / odds_lay_live
+        prob_esito_scoperto = 1.0 - prob_model
+        edge_pct = (implied_prob_betfair - prob_esito_scoperto) * 100
+        liab = odds_lay_live - 1.0
 
         if liab <= 0:
             return
 
-        edge_abs = p_win * b_net - p_loss * liab
-        edge_pct = (edge_abs / liab) * 100  # edge relativo alla liability
+        p_win  = prob_model
+        p_loss = prob_esito_scoperto
 
         # Quota implicita Betfair per il runner layato
         implied_prob_betfair = 1.0 / odds_lay_live

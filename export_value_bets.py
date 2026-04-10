@@ -59,7 +59,7 @@ def calc_edge(prob_model, odds_bk):
     if not odds_bk or odds_bk <= 1:
         return None, None
     implied = 1.0 / odds_bk
-    edge = (prob_model - implied) / implied * 100
+    edge = (prob_model - implied) * 100
     return round(edge, 1), round(implied * 100, 1)
 
 def main(league: str, min_edge: float, odds_source: str = "theoddsapi", odds_key: str = ""):

@@ -129,7 +129,7 @@ def run_bot(dry_run: bool = DRY_RUN):
         trading.logout()
         sys.exit(0)
 
-    market_ids = [vb["market_id"] for vb in value_bets]
+    market_ids = list(dict.fromkeys(vb["market_id"] for vb in value_bets))  # deduplica
     logger.info(f"Monitoraggio {len(market_ids)} mercati: {market_ids}")
 
     # ─── NOTIFICA AVVIO ──────────────────────────────────────────────────────

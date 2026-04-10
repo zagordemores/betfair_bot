@@ -203,8 +203,25 @@ def main(league: str, min_edge: float, odds_source: str = "theoddsapi", odds_key
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--league",       default="serie_a")
-    parser.add_argument("--min-edge",     type=float, default=8.0)
+    parser.add_argument("--all-leagues",  action="store_true")
+    parser.add_argument("--min-edge",     type=float, default=5.0)
     parser.add_argument("--odds-source",  default="theoddsapi", choices=["theoddsapi", "oddsio"])
     parser.add_argument("--odds-key",     default="")
     args = parser.parse_args()
-    main(args.league, args.min_edge, args.odds_source, args.odds_key)
+
+    leagues = ["serie_a", "premier_league", "la_liga", "champions_league"] if args.all_leagues else [args.league]
+    all_bets = []
+    for lg in leagues:
+        main(lg, args.min_edge, args.odds_source, args.odds_key)
+        try:
+            with open(OUTPUT_FILE) as f:
+                data = json.load(f)
+            bets = data if isinstance(data, list) else data.get("bets", [])
+            all_bets.extend(bets)
+        except Exception as e:
+            print(f"Errore lettura {lg}: {e}")
+    if args.all_leagues:
+        output = {"generated_at": datetime.now().isoformat(), "bets": all_bets}
+        with open(OUTPUT_FILE, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"Totale: {len(all_bets)} value bets da tutti i campionati")

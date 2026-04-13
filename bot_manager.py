@@ -129,6 +129,15 @@ def run_bot(dry_run: bool = DRY_RUN):
         trading.logout()
         sys.exit(0)
 
+    # Salva JSON arricchito su disco
+    try:
+        enriched_output = {"generated_at": __import__('datetime').datetime.now().isoformat(), "bets": value_bets}
+        with open(VALUE_BETS_JSON, 'w') as f:
+            __import__('json').dump(enriched_output, f, indent=2, default=str)
+        logger.info(f"JSON arricchito salvato: {len(value_bets)} bets con market_id")
+    except Exception as e:
+        logger.error(f"Errore salvataggio JSON arricchito: {e}")
+
     market_ids = list(dict.fromkeys(vb["market_id"] for vb in value_bets))  # deduplica
     logger.info(f"Monitoraggio {len(market_ids)} mercati: {market_ids}")
 

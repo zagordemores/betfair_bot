@@ -91,10 +91,7 @@ class DCBettingStrategy(BaseStrategy):
 
         # Filtro base sulle odds (guardrail di sicurezza)
         if odds_lay_live < MIN_ODDS or odds_lay_live > MAX_ODDS:
-            logger.debug(
-                f"[{market_id}] Quota lay {odds_lay_live:.2f} fuori range "
-                f"[{MIN_ODDS}-{MAX_ODDS}], skip"
-            )
+            logger.info(f"[SKIP] [{market_id}] {vb['home']} vs {vb['away']} | quota {odds_lay_live:.2f} fuori range [{MIN_ODDS}-{MAX_ODDS}]")
             return
 
         # ── STEP 2: Calcola edge REALE su quote Betfair live ─────────────
@@ -124,10 +121,7 @@ class DCBettingStrategy(BaseStrategy):
         )
 
         if edge_pct < MIN_EDGE * 100:
-            logger.debug(
-                f"[{market_id}] Edge Betfair {edge_pct:.1f}% < minimo "
-                f"{MIN_EDGE*100:.0f}%, skip"
-            )
+            logger.info(f"[SKIP] [{market_id}] {vb['home']} vs {vb['away']} | DC {dc_type} @{odds_lay_live:.2f} | edge {edge_pct:.1f}% < {MIN_EDGE*100:.0f}%")
             return
 
         # ── STEP 3: Kelly stake su quote Betfair live ─────────────────────
